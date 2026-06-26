@@ -19,19 +19,17 @@ if engine:
             conn.execute(text("ALTER TABLE change_logs ADD COLUMN IF NOT EXISTS prev_result_text TEXT;"))
             conn.execute(text("ALTER TABLE change_logs ADD COLUMN IF NOT EXISTS prev_modifier VARCHAR(255);"))
             conn.execute(text("ALTER TABLE combinations ADD COLUMN IF NOT EXISTS version INTEGER DEFAULT 0;"))
-            print("DB 자동 패치 완료!")
+        print("DB 자동 패치 완료!")
     except Exception as e:
         print("DB 패치 오류:", e)
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# 🌟 404 에러 방지용 루트 경로
 @app.get("/")
 def read_root():
     return {"status": "ok"}
 
-# ... (생략된 CheckRequest, RollbackRequest 클래스는 그대로 유지) ...
 class CheckRequest(BaseModel):
     combo_id: str
     is_checked: bool
@@ -53,12 +51,10 @@ def get_combinations():
     finally:
         db.close()
 
-# 🌟 범인 잡는 로그 함수 (에러 발생 시 죽지 않고 내용을 출력)
 @app.get("/api/logs")
 def get_logs():
     db = SessionLocal()
     try:
-        # JOIN을 제거하고 가장 단순하게 조회하여 에러 원인 차단
         query = text("SELECT id as log_id, action, nickname, timestamp FROM change_logs ORDER BY timestamp DESC LIMIT 50")
         return [dict(row) for row in db.execute(query).mappings().all()]
     except Exception as e:
@@ -66,20 +62,43 @@ def get_logs():
     finally:
         db.close()
 
-# ... (기존 update_combination, rollback_change 함수는 그대로 유지) ...
 @app.post("/api/check")
 def update_combination(req: CheckRequest):
     db = SessionLocal()
     try:
         modifier = "관리자" if req.admin_token == "hanwol123" else req.nickname
-        current = db.execute(text("SELECT is_checked, result_text, last_modified_by, version FROM combinations WHERE id = :id"), {"id": req.combo_id}).mappings().first()
-        if not current: raise HTTPException(status_code=404, detail="조합 없음")
-        if current["version"] != req.version: raise HTTPException(status_code=409, detail="데이터 변경됨")
-        
-        db.execute(text("""UPDATE combinations SET is_checked = :is_checked, last_modified_by = :modifier, result_text = :result_text, version = version + 1 WHERE id = :combo_id"""),
-                   {"is_checked": req.is_checked, "modifier": modifier, "result_text": req.result_text, "combo_id": req.combo_id})
-        db.execute(text("""INSERT INTO change_logs (combo_id, action, nickname, prev_is_checked, prev_result_text, prev_modifier) VALUES (:combo_id, :action, :nickname, :prev, :prev_text, :prev_mod)"""),
-                   {"combo_id": req.combo_id, "action": "체크" if req.is_checked else "체크해제", "nickname": modifier, "prev": current["is_checked"], "prev_text": current["result_text"], "prev_mod": current["last_modified_by"]})
+        current = db.execute(
+            text("SELECT is_checked, result_text, last_modified_by, version FROM combinations WHERE id = :id"),
+            {"id": req.combo_id}
+        ).mappings().first()
+
+        if not current:
+            raise HTTPException(status_code=404, detail="조합 없음")
+        if current["version"] != req.version:
+            raise HTTPException(status_code=409, detail="데이터 변경됨. 페이지를 새로고침 후 다시 시도해주세요.")
+
+        db.execute(
+            text("""
+                UPDATE combinations
+                SET is_checked = :is_checked, last_modified_by = :modifier, result_text = :result_text, version = version + 1
+                WHERE id = :combo_id
+            """),
+            {"is_checked": req.is_checked, "modifier": modifier, "result_text": req.result_text, "combo_id": req.combo_id}
+        )
+        db.execute(
+            text("""
+                INSERT INTO change_logs (combo_id, action, nickname, prev_is_checked, prev_result_text, prev_modifier, timestamp)
+                VALUES (:combo_id, :action, :nickname, :prev, :prev_text, :prev_mod, NOW() AT TIME ZONE 'Asia/Seoul')
+            """),
+            {
+                "combo_id": req.combo_id,
+                "action": "체크" if req.is_checked else "체크해제",
+                "nickname": modifier,
+                "prev": current["is_checked"],
+                "prev_text": current["result_text"],
+                "prev_mod": current["last_modified_by"]
+            }
+        )
         db.commit()
         return {"success": True}
     finally:
@@ -87,13 +106,31 @@ def update_combination(req: CheckRequest):
 
 @app.post("/api/rollback")
 def rollback_change(req: RollbackRequest):
-    if req.admin_token != "hanwol123": raise HTTPException(status_code=403, detail="권한 없음")
+    if req.admin_token != "hanwol123":
+        raise HTTPException(status_code=403, detail="권한 없음")
     db = SessionLocal()
     try:
-        log = db.execute(text("SELECT combo_id, prev_is_checked, prev_result_text, prev_modifier FROM change_logs WHERE id = :log_id"), {"log_id": req.log_id}).mappings().first()
-        if not log: raise HTTPException(status_code=404, detail="로그 없음")
-        db.execute(text("UPDATE combinations SET is_checked = :is_checked, result_text = :result_text, last_modified_by = :modifier, version = version + 1 WHERE id = :combo_id"), 
-                   {"is_checked": log["prev_is_checked"], "result_text": log["prev_result_text"], "modifier": log["prev_modifier"], "combo_id": log["combo_id"]})
+        log = db.execute(
+            text("SELECT combo_id, prev_is_checked, prev_result_text, prev_modifier FROM change_logs WHERE id = :log_id"),
+            {"log_id": req.log_id}
+        ).mappings().first()
+
+        if not log:
+            raise HTTPException(status_code=404, detail="로그 없음")
+
+        db.execute(
+            text("""
+                UPDATE combinations
+                SET is_checked = :is_checked, result_text = :result_text, last_modified_by = :modifier, version = version + 1
+                WHERE id = :combo_id
+            """),
+            {
+                "is_checked": log["prev_is_checked"],
+                "result_text": log["prev_result_text"],
+                "modifier": log["prev_modifier"],
+                "combo_id": log["combo_id"]
+            }
+        )
         db.commit()
         return {"success": True}
     finally:
