@@ -1,66 +1,109 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from database import SessionLocal, Combination
+from typing import Optional
+import database
 
 app = FastAPI()
 
-# 1. CORS 설정 (내 컴퓨터의 HTML 파일에서 서버로 접근할 수 있게 허용)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 2. DB 세션 관리 함수
 def get_db():
-    db = SessionLocal()
+    db = database.SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-# 3. 클라이언트가 서버로 보낼 '체크 데이터' 패킷 구조체
+# 클라이언트 요청 데이터 구조 정의
 class CheckRequest(BaseModel):
     combo_id: str
     is_checked: bool
+    nickname: str               # 🌟 유저 닉네임 필수화
+    admin_token: Optional[str] = None # 🌟 관리자 인증 토큰 (옵션)
 
-
-# ==========================================
-# 🟢 서버 상태 확인용 API
-# ==========================================
-
-@app.get("/")
-def read_root():
-    return {"message": "약초 조합 서버가 정상적으로 작동 중입니다!"}
-
-@app.get("/stats")
-def get_stats(db: Session = Depends(get_db)):
-    total_count = db.query(Combination).count()
-    return {"message": f"현재 DB에 {total_count}개의 약초 조합이 성공적으로 저장되어 있습니다."}
-
-
-# ==========================================
-# 🚀 프론트엔드 통신용 핵심 API
-# ==========================================
-
-# API 1: 전체 조합 데이터 불러오기
 @app.get("/api/combinations")
-def get_all_combinations(db: Session = Depends(get_db)):
-    combinations = db.query(Combination).all()
-    return combinations
+def get_combinations(db: Session = Depends(get_db)):
+    # 데이터 조회 시 수정자 정보도 함께 내려갑니다.
+    combos = db.query(database.Combination).all()
+    return combos
 
-# API 2: 특정 조합의 체크 상태 업데이트하기
 @app.post("/api/check")
 def update_check_status(req: CheckRequest, db: Session = Depends(get_db)):
-    combo = db.query(Combination).filter(Combination.id == req.combo_id).first()
+    ADMIN_TOKEN = "hanwol123" # 🌟 나만 사용할 관리자 비밀번호
+    is_admin = (req.admin_token == ADMIN_TOKEN)
+
+    combo = db.query(database.Combination).filter(database.Combination.id == req.combo_id).first()
+    if not combo:
+        raise HTTPException(status_code=404, detail="조합을 찾을 수 없습니다.")
+
+    # 🛑 [권한 검사] 체크를 해제(False) 하려고 할 때
+    if not req.is_checked:
+        # 관리자도 아니고, 마지막으로 체크한 사람의 닉네임과 현재 요청한 사람의 닉네임이 다르면 거부
+        if not is_admin and combo.last_modified_by != req.nickname:
+            return {
+                "success": False, 
+                "message": f"이 항목은 '{combo.last_modified_by}'님이 체크했습니다. 본인이 체크한 항목만 해제할 수 있습니다."
+            }
+
+    # 갱신 처리
+    combo.is_checked = req.is_checked
+    # 체크될 때만 닉네임을 남기고, 완전히 해제되면 수정한 사람 이름을 비웁니다.
+    combo.last_modified_by = req.nickname if req.is_checked else None
     
+    # 📝 [로그 기록] 어떤 유저가 어떤 행동을 했는지 영구 저장
+    action_type = "CHECK" if req.is_checked else "UNCHECK"
+    log_entry = database.ChangeLog(
+        combo_id=req.combo_id,
+        action=action_type,
+        nickname=req.nickname
+    )
+    db.add(log_entry)
+    db.commit()
+
+    return {
+        "success": True, 
+        "combo_id": req.combo_id, 
+        "is_checked": req.is_checked, 
+        "last_modified_by": combo.last_modified_by
+    }
+
+# 🛠️ [로그 기반 롤백 엔드포인트] 관리자가 문제 발생 시 최근 기록을 취소하는 기능
+@app.post("/api/rollback/latest")
+def rollback_latest_action(admin_token: str, db: Session = Depends(get_db)):
+    if admin_token != "hanwol123":
+        raise HTTPException(status_code=403, detail="관리자 권한이 없습니다.")
+    
+    # 가장 최근의 정상 액션 로그 가져오기 (이미 복구된 건 제외)
+    latest_log = db.query(database.ChangeLog).filter(~database.ChangeLog.action.like("ROLLBACK%")).order_by(database.ChangeLog.timestamp.desc()).first()
+    if not latest_log:
+        return {"success": False, "message": "되돌릴 로그 기록이 없습니다."}
+    
+    combo = db.query(database.Combination).filter(database.Combination.id == latest_log.combo_id).first()
     if combo:
-        combo.is_checked = req.is_checked  # 상태 업데이트
-        db.commit()                        # DB에 저장
-        return {"success": True, "combo_id": req.combo_id, "is_checked": req.is_checked}
+        # 정반대 상태로 복구
+        if latest_log.action == "CHECK":
+            combo.is_checked = False
+            combo.last_modified_by = None
+        else:
+            combo.is_checked = True
+            combo.last_modified_by = latest_log.nickname
+            
+        # 롤백 완료 로그 남기기
+        rollback_log = database.ChangeLog(
+            combo_id=latest_log.combo_id,
+            action=f"ROLLBACK_{latest_log.id}",
+            nickname="ADMIN_SYSTEM"
+        )
+        db.add(rollback_log)
+        db.commit()
+        return {"success": True, "message": f"[{latest_log.nickname}]님의 최근 행동({latest_log.action})을 되돌렸습니다. 대상 ID: {latest_log.combo_id}"}
     
-    return {"success": False, "message": "해당 조합을 찾을 수 없습니다."}
+    return {"success": False, "message": "조합을 찾을 수 없습니다."}
