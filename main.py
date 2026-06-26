@@ -9,6 +9,9 @@ DB_URL = os.getenv("DATABASE_URL")
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
+# 환경변수에서 관리자 토큰 읽기 (없으면 기본값 사용)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "hanwol123")
+
 engine = create_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
@@ -41,6 +44,8 @@ class CheckRequest(BaseModel):
 class RollbackRequest(BaseModel):
     log_id: int
     admin_token: str
+    combo_id: str
+    version: int
 
 @app.get("/api/combinations")
 def get_combinations():
@@ -55,7 +60,8 @@ def get_combinations():
 def get_logs():
     db = SessionLocal()
     try:
-        query = text("SELECT id as log_id, action, nickname, timestamp FROM change_logs ORDER BY timestamp DESC LIMIT 50")
+        # 200개로 제한 통일
+        query = text("SELECT id as log_id, action, nickname, timestamp FROM change_logs ORDER BY timestamp DESC LIMIT 200")
         return [dict(row) for row in db.execute(query).mappings().all()]
     except Exception as e:
         return {"error_details": str(e)}
@@ -66,7 +72,7 @@ def get_logs():
 def update_combination(req: CheckRequest):
     db = SessionLocal()
     try:
-        modifier = "관리자" if req.admin_token == "hanwol123" else req.nickname
+        modifier = "관리자" if req.admin_token == ADMIN_TOKEN else req.nickname
         current = db.execute(
             text("SELECT is_checked, result_text, last_modified_by, version FROM combinations WHERE id = :id"),
             {"id": req.combo_id}
@@ -106,7 +112,7 @@ def update_combination(req: CheckRequest):
 
 @app.post("/api/rollback")
 def rollback_change(req: RollbackRequest):
-    if req.admin_token != "hanwol123":
+    if req.admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="권한 없음")
     db = SessionLocal()
     try:
@@ -117,6 +123,17 @@ def rollback_change(req: RollbackRequest):
 
         if not log:
             raise HTTPException(status_code=404, detail="로그 없음")
+
+        # 롤백도 version 충돌 체크
+        current = db.execute(
+            text("SELECT version FROM combinations WHERE id = :id"),
+            {"id": req.combo_id}
+        ).mappings().first()
+
+        if not current:
+            raise HTTPException(status_code=404, detail="조합 없음")
+        if current["version"] != req.version:
+            raise HTTPException(status_code=409, detail="데이터 변경됨. 페이지를 새로고침 후 다시 시도해주세요.")
 
         db.execute(
             text("""
