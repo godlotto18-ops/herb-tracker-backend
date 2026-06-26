@@ -58,10 +58,12 @@ def get_combinations():
 def get_logs():
     db = SessionLocal()
     try:
+        # 🌟 INNER JOIN 대신 LEFT JOIN을 사용하여 데이터 연결이 안 되어도 로그가 나오게 함
+        # COALESCE를 사용하여 데이터가 없는 경우를 방지
         query = text("""
-            SELECT l.id as log_id, l.action, l.nickname, l.timestamp, c.herbs 
+            SELECT l.id as log_id, l.action, l.nickname, l.timestamp, COALESCE(c.herbs, '삭제된 조합') as herbs 
             FROM change_logs l
-            JOIN combinations c ON l.combo_id = c.id
+            LEFT JOIN combinations c ON l.combo_id = c.id
             ORDER BY l.timestamp DESC 
             LIMIT 200
         """)
