@@ -12,6 +12,17 @@ if DB_URL and DB_URL.startswith("postgres://"):
 engine = create_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+# 🌟 서버 시작 시 DB 테이블을 자동 점검하고 수정하는 로직
+if engine:
+    try:
+        with engine.begin() as conn:  # .begin()을 쓰면 자동 commit 됩니다.
+            conn.execute(text("ALTER TABLE change_logs ADD COLUMN IF NOT EXISTS prev_is_checked BOOLEAN;"))
+            conn.execute(text("ALTER TABLE change_logs ADD COLUMN IF NOT EXISTS prev_result_text TEXT;"))
+            conn.execute(text("ALTER TABLE change_logs ADD COLUMN IF NOT EXISTS prev_modifier VARCHAR(255);"))
+            print("DB 테이블 자동 패치 완료!")
+    except Exception as e:
+        print("DB 패치 중 오류 발생 (무시해도 될 수 있음):", e)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -47,7 +58,6 @@ def get_combinations():
 def get_logs():
     db = SessionLocal()
     try:
-        # 로그 데이터와 함께 고유 id도 가져옵니다.
         query = text("""
             SELECT l.id as log_id, l.action, l.nickname, l.timestamp, c.herbs 
             FROM change_logs l
@@ -65,13 +75,11 @@ def update_combination(req: CheckRequest):
     try:
         modifier = "관리자" if req.admin_token == "hanwol123" else req.nickname
 
-        # 1. 🌟 현재 상태 가져오기 (스냅샷 저장용)
         current = db.execute(text("SELECT is_checked, result_text, last_modified_by FROM combinations WHERE id = :id"), {"id": req.combo_id}).mappings().first()
         prev_is_checked = current["is_checked"] if current else False
         prev_result_text = current["result_text"] if current else ""
         prev_modifier = current["last_modified_by"] if current else ""
 
-        # 2. 데이터 업데이트
         update_query = text("""
             UPDATE combinations 
             SET is_checked = :is_checked, last_modified_by = :modifier, result_text = :result_text
@@ -82,7 +90,6 @@ def update_combination(req: CheckRequest):
             "result_text": req.result_text, "combo_id": req.combo_id
         })
 
-        # 3. 🌟 로그와 함께 과거 상태(스냅샷) 저장
         log_query = text("""
             INSERT INTO change_logs (combo_id, action, nickname, prev_is_checked, prev_result_text, prev_modifier) 
             VALUES (:combo_id, :action, :nickname, :prev, :prev_text, :prev_mod)
@@ -100,7 +107,6 @@ def update_combination(req: CheckRequest):
     finally:
         db.close()
 
-# 🌟 새로운 엔드포인트: 롤백 기능
 @app.post("/api/rollback")
 def rollback_change(req: RollbackRequest):
     if req.admin_token != "hanwol123":
@@ -108,13 +114,11 @@ def rollback_change(req: RollbackRequest):
     
     db = SessionLocal()
     try:
-        # 1. 로그에서 과거 스냅샷 데이터 꺼내오기
         log = db.execute(text("SELECT combo_id, prev_is_checked, prev_result_text, prev_modifier FROM change_logs WHERE id = :log_id"), {"log_id": req.log_id}).mappings().first()
         
         if not log:
             raise HTTPException(status_code=404, detail="로그를 찾을 수 없습니다.")
 
-        # 2. 과거 상태로 덮어쓰기 (롤백)
         db.execute(text("""
             UPDATE combinations 
             SET is_checked = :is_checked, result_text = :result_text, last_modified_by = :modifier
@@ -126,7 +130,6 @@ def rollback_change(req: RollbackRequest):
             "combo_id": log["combo_id"]
         })
         
-        # 3. 롤백을 했다는 기록 남기기
         db.execute(text("INSERT INTO change_logs (combo_id, action, nickname) VALUES (:combo_id, '복구(롤백)', '관리자')"), {"combo_id": log["combo_id"]})
         
         db.commit()
