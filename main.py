@@ -58,14 +58,15 @@ def get_combinations():
 def get_logs():
     db = SessionLocal()
     try:
-        # 🌟 JOIN을 빼고 아주 단순하게 조회합니다.
-        # 에러가 나면 return값으로 에러 내용을 화면에 보여줍니다.
-        query = text("SELECT id as log_id, action, nickname, timestamp FROM change_logs ORDER BY timestamp DESC LIMIT 50")
-        result = db.execute(query).mappings().all()
-        return [dict(row) for row in result]
-    except Exception as e:
-        # 에러가 나면 서버가 뻗는 대신, 화면에 에러 내용을 뿌려줍니다.
-        return {"error": str(e)}
+        # 🌟 이제 로그와 조합 정보를 합쳐서(JOIN) 가져옵니다.
+        query = text("""
+            SELECT l.id as log_id, l.action, l.nickname, l.timestamp, COALESCE(c.herbs, '삭제된 조합') as herbs 
+            FROM change_logs l
+            LEFT JOIN combinations c ON l.combo_id = c.id
+            ORDER BY l.timestamp DESC 
+            LIMIT 200
+        """)
+        return [dict(row) for row in db.execute(query).mappings().all()]
     finally:
         db.close()
 
