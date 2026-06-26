@@ -9,7 +9,6 @@ DB_URL = os.getenv("DATABASE_URL")
 if DB_URL and DB_URL.startswith("postgres://"):
     DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-# 환경변수에서 관리자 토큰 읽기 (없으면 기본값 사용)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "hanwol123")
 
 engine = create_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
@@ -60,8 +59,25 @@ def get_combinations():
 def get_logs():
     db = SessionLocal()
     try:
-        # 200개로 제한 통일
-        query = text("SELECT id as log_id, action, nickname, timestamp FROM change_logs ORDER BY timestamp DESC LIMIT 200")
+        # herbs, 변경 전/후 result_text, is_checked 모두 포함
+        query = text("""
+            SELECT
+                cl.id as log_id,
+                cl.action,
+                cl.nickname,
+                cl.timestamp,
+                cl.combo_id,
+                cl.prev_is_checked,
+                cl.prev_result_text,
+                cl.prev_modifier,
+                c.herbs,
+                c.result_text as current_result_text,
+                c.is_checked as current_is_checked
+            FROM change_logs cl
+            LEFT JOIN combinations c ON cl.combo_id = c.id
+            ORDER BY cl.timestamp DESC
+            LIMIT 200
+        """)
         return [dict(row) for row in db.execute(query).mappings().all()]
     except Exception as e:
         return {"error_details": str(e)}
@@ -117,14 +133,13 @@ def rollback_change(req: RollbackRequest):
     db = SessionLocal()
     try:
         log = db.execute(
-            text("SELECT combo_id, prev_is_checked, prev_result_text, prev_modifier FROM change_logs WHERE id = :log_id"),
+            text("SELECT id, combo_id, prev_is_checked, prev_result_text, prev_modifier, timestamp FROM change_logs WHERE id = :log_id"),
             {"log_id": req.log_id}
         ).mappings().first()
 
         if not log:
             raise HTTPException(status_code=404, detail="로그 없음")
 
-        # 롤백도 version 충돌 체크
         current = db.execute(
             text("SELECT version FROM combinations WHERE id = :id"),
             {"id": req.combo_id}
@@ -148,6 +163,17 @@ def rollback_change(req: RollbackRequest):
                 "combo_id": log["combo_id"]
             }
         )
+
+        # 해당 로그 시점 이후의 로그 삭제 (같은 combo_id 한정)
+        db.execute(
+            text("""
+                DELETE FROM change_logs
+                WHERE combo_id = :combo_id
+                AND timestamp >= :log_timestamp
+            """),
+            {"combo_id": log["combo_id"], "log_timestamp": log["timestamp"]}
+        )
+
         db.commit()
         return {"success": True}
     finally:
