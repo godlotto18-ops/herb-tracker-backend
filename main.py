@@ -1,12 +1,23 @@
-from fastapi import FastAPI, Depends, HTTPException
+import os
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
-from typing import Optional
-import database
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+# 1. 데이터베이스 연결 설정 (Render 환경 변수 사용)
+DB_URL = os.getenv("DATABASE_URL")
+# Render의 postgres:// 주소를 SQLAlchemy가 인식할 수 있는 postgresql:// 로 자동 변환
+if DB_URL and DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+
+# DB 엔진 및 세션 생성
+engine = create_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 app = FastAPI()
 
+# 2. CORS 설정 (프론트엔드 연동)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,95 +26,85 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_db():
-    db = database.SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# 클라이언트 요청 데이터 구조 정의
+# 3. 데이터 검증 모델 (🌟 result_text 추가됨)
 class CheckRequest(BaseModel):
     combo_id: str
     is_checked: bool
-    nickname: str               # 🌟 유저 닉네임 필수화
-    admin_token: Optional[str] = None # 🌟 관리자 인증 토큰 (옵션)
+    nickname: str
+    admin_token: str = ""
+    result_text: str = ""  # 프론트엔드에서 넘어오는 텍스트 결과값
 
+# 4. API: 전체 약초 조합 데이터 불러오기
 @app.get("/api/combinations")
-def get_combinations(db: Session = Depends(get_db)):
-    # 데이터 조회 시 수정자 정보도 함께 내려갑니다.
-    combos = db.query(database.Combination).all()
-    return combos
+def get_combinations():
+    if not engine:
+        raise HTTPException(status_code=500, detail="DB URL이 설정되지 않았습니다.")
+        
+    db = SessionLocal()
+    try:
+        # 🌟 DB에서 가져올 때 result_text 컬럼도 함께 불러옵니다.
+        query = text("""
+            SELECT id, herbs, count, is_checked, last_modified_by, result_text 
+            FROM combinations
+            ORDER BY count ASC
+        """)
+        result = db.execute(query).mappings().all()
+        
+        # 결과를 딕셔너리 리스트로 변환하여 프론트엔드로 전달
+        return [dict(row) for row in result]
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        raise HTTPException(status_code=500, detail="데이터를 불러오는 중 오류가 발생했습니다.")
+    finally:
+        db.close()
 
+# 5. API: 체크 상태 및 결과 텍스트 업데이트
 @app.post("/api/check")
-def update_check_status(req: CheckRequest, db: Session = Depends(get_db)):
-    ADMIN_TOKEN = "hanwol123" # 🌟 나만 사용할 관리자 비밀번호
-    is_admin = (req.admin_token == ADMIN_TOKEN)
+def update_combination(req: CheckRequest):
+    if not engine:
+        raise HTTPException(status_code=500, detail="DB URL이 설정되지 않았습니다.")
 
-    combo = db.query(database.Combination).filter(database.Combination.id == req.combo_id).first()
-    if not combo:
-        raise HTTPException(status_code=404, detail="조합을 찾을 수 없습니다.")
+    db = SessionLocal()
+    try:
+        # 관리자 비밀번호 확인 (맞으면 '관리자', 아니면 유저 '닉네임'으로 저장)
+        modifier = "관리자" if req.admin_token == "hanwol123" else req.nickname
 
-    # 🛑 [권한 검사] 체크를 해제(False) 하려고 할 때
-    if not req.is_checked:
-        # 관리자도 아니고, 마지막으로 체크한 사람의 닉네임과 현재 요청한 사람의 닉네임이 다르면 거부
-        if not is_admin and combo.last_modified_by != req.nickname:
-            return {
-                "success": False, 
-                "message": f"이 항목은 '{combo.last_modified_by}'님이 체크했습니다. 본인이 체크한 항목만 해제할 수 있습니다."
-            }
+        # 🌟 combinations 테이블 업데이트 (result_text 포함)
+        update_query = text("""
+            UPDATE combinations 
+            SET is_checked = :is_checked, 
+                last_modified_by = :modifier,
+                result_text = :result_text
+            WHERE id = :combo_id
+        """)
+        
+        db.execute(update_query, {
+            "is_checked": req.is_checked,
+            "modifier": modifier,
+            "result_text": req.result_text,
+            "combo_id": req.combo_id
+        })
 
-    # 갱신 처리
-    combo.is_checked = req.is_checked
-    # 체크될 때만 닉네임을 남기고, 완전히 해제되면 수정한 사람 이름을 비웁니다.
-    combo.last_modified_by = req.nickname if req.is_checked else None
-    
-    # 📝 [로그 기록] 어떤 유저가 어떤 행동을 했는지 영구 저장
-    action_type = "CHECK" if req.is_checked else "UNCHECK"
-    log_entry = database.ChangeLog(
-        combo_id=req.combo_id,
-        action=action_type,
-        nickname=req.nickname
-    )
-    db.add(log_entry)
-    db.commit()
+        # 누가 어떤 액션을 했는지 change_logs 테이블에 기록 남기기
+        log_query = text("""
+            INSERT INTO change_logs (combo_id, action, nickname) 
+            VALUES (:combo_id, :action, :nickname)
+        """)
+        db.execute(log_query, {
+            "combo_id": req.combo_id,
+            "action": "check" if req.is_checked else "uncheck",
+            "nickname": modifier
+        })
 
-    return {
-        "success": True, 
-        "combo_id": req.combo_id, 
-        "is_checked": req.is_checked, 
-        "last_modified_by": combo.last_modified_by
-    }
-
-# 🛠️ [로그 기반 롤백 엔드포인트] 관리자가 문제 발생 시 최근 기록을 취소하는 기능
-@app.post("/api/rollback/latest")
-def rollback_latest_action(admin_token: str, db: Session = Depends(get_db)):
-    if admin_token != "hanwol123":
-        raise HTTPException(status_code=403, detail="관리자 권한이 없습니다.")
-    
-    # 가장 최근의 정상 액션 로그 가져오기 (이미 복구된 건 제외)
-    latest_log = db.query(database.ChangeLog).filter(~database.ChangeLog.action.like("ROLLBACK%")).order_by(database.ChangeLog.timestamp.desc()).first()
-    if not latest_log:
-        return {"success": False, "message": "되돌릴 로그 기록이 없습니다."}
-    
-    combo = db.query(database.Combination).filter(database.Combination.id == latest_log.combo_id).first()
-    if combo:
-        # 정반대 상태로 복구
-        if latest_log.action == "CHECK":
-            combo.is_checked = False
-            combo.last_modified_by = None
-        else:
-            combo.is_checked = True
-            combo.last_modified_by = latest_log.nickname
-            
-        # 롤백 완료 로그 남기기
-        rollback_log = database.ChangeLog(
-            combo_id=latest_log.combo_id,
-            action=f"ROLLBACK_{latest_log.id}",
-            nickname="ADMIN_SYSTEM"
-        )
-        db.add(rollback_log)
+        # 최종 저장(Commit)
         db.commit()
-        return {"success": True, "message": f"[{latest_log.nickname}]님의 최근 행동({latest_log.action})을 되돌렸습니다. 대상 ID: {latest_log.combo_id}"}
-    
-    return {"success": False, "message": "조합을 찾을 수 없습니다."}
+
+        # 프론트엔드에 성공 신호와 수정자 이름 반환
+        return {"success": True, "last_modified_by": modifier}
+
+    except Exception as e:
+        db.rollback() # 에러가 나면 DB를 이전 상태로 되돌림
+        print(f"Error updating data: {e}")
+        raise HTTPException(status_code=500, detail="데이터 업데이트 중 오류가 발생했습니다.")
+    finally:
+        db.close()
